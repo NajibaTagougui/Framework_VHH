@@ -1,0 +1,6 @@
+{
+  "name": "NanoVHH Protein Engineering Studio",
+  "description": "Computational platform for VHH nanobody sequence analysis, binding affinity prediction, stability optimization, and cloud batch engineering.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
