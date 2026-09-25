@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState, useMemo } from 'react';
+import { useEffect, useRef, useState, useMemo, useCallback } from 'react';
 import * as THREE from 'three';
 import { VhhCandidate } from '../types';
-import { generateVhhPdb, PdbResidueCoordinate } from '../utils/biophysics';
+import { generateVhhPdb, parsePdbToCoordinates, PdbResidueCoordinate } from '../utils/biophysics';
 import {
   Layers,
   RotateCcw,
@@ -14,7 +14,8 @@ import {
   Info,
   ShieldCheck,
   Zap,
-  Activity
+  Activity,
+  RefreshCw
 } from 'lucide-react';
 
 interface EsmFoldPreviewProps {
@@ -30,34 +31,105 @@ export function EsmFoldPreview({ candidate, compact = false }: EsmFoldPreviewPro
   const [hoveredResidue, setHoveredResidue] = useState<PdbResidueCoordinate | null>(null);
   const [showDisulfide, setShowDisulfide] = useState(true);
   const [showHallmarks, setShowHallmarks] = useState(true);
-  const [loading, setLoading] = useState(false);
-  const [sourceType, setSourceType] = useState<'esmfold-live' | 'esmfold-biophysics'>('esmfold-biophysics');
 
-  // Generate 3D coordinates & PDB data for current sequence
-  const { pdbText, coordinates, meanPlddt } = useMemo(() => {
-    return generateVhhPdb(candidate.sequence, candidate.name, candidate.regions);
-  }, [candidate.sequence, candidate.name, candidate.regions]);
+  // ESMFold live state
+  const [activeCoordinates, setActiveCoordinates] = useState<PdbResidueCoordinate[]>([]);
+  const [activePdbText, setActivePdbText] = useState<string>('');
+  const [activeMeanPlddt, setActiveMeanPlddt] = useState<number>(88.0);
+  const [isLiveApi, setIsLiveApi] = useState<boolean>(false);
+  const [apiLoading, setApiLoading] = useState<boolean>(false);
+  const [apiNotice, setApiNotice] = useState<string | null>(null);
 
-  // Statistics
+  // Fetch from direct ESMFold API endpoint with biophysical fallback
+  const requestEsmFoldPrediction = useCallback(async (seq: string, name: string) => {
+    setApiLoading(true);
+    setApiNotice(null);
+
+    try {
+      const response = await fetch('/api/esmfold', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ sequence: seq, name }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.status === 'success' && data.pdb) {
+        const parsed = parsePdbToCoordinates(data.pdb, seq, candidate.regions);
+        if (parsed.coordinates.length > 20) {
+          setActiveCoordinates(parsed.coordinates);
+          setActivePdbText(data.pdb);
+          setActiveMeanPlddt(data.meanPlddt || parsed.meanPlddt);
+          setIsLiveApi(true);
+          setApiNotice(data.cached ? 'Loaded from instant cache (Meta ESMFold v1)' : 'Direct prediction from Meta ESMFold v1 API');
+          setApiLoading(false);
+          return;
+        }
+      }
+
+      // If fallback notice
+      if (data.notice) {
+        setApiNotice(data.notice);
+      }
+      setIsLiveApi(false);
+    } catch (err: any) {
+      console.warn('Live ESMFold fetch issue, using calibrated biophysical coordinates:', err);
+      setIsLiveApi(false);
+      setApiNotice('Live API connection busy. Rendered calibrated atomistic biophysical fold.');
+    } finally {
+      setApiLoading(false);
+    }
+  }, [candidate.regions]);
+
+  // When candidate changes, seed immediately with high-accuracy biophysics, then query live ESMFold
+  useEffect(() => {
+    const initial = generateVhhPdb(candidate.sequence, candidate.name, candidate.regions);
+    setActiveCoordinates(initial.coordinates);
+    setActivePdbText(initial.pdbText);
+    setActiveMeanPlddt(initial.meanPlddt);
+    setIsLiveApi(false);
+
+    // Call live ESMFold API
+    requestEsmFoldPrediction(candidate.sequence, candidate.name);
+  }, [candidate.sequence, candidate.name, requestEsmFoldPrediction]);
+
+  // Statistics derived from active coordinates
   const stats = useMemo(() => {
-    const coreCoords = coordinates.filter(c => c.region === 'FR1' || c.region === 'FR2' || c.region === 'FR3' || c.region === 'FR4');
-    const cdr3Coords = coordinates.filter(c => c.region === 'CDR3');
+    const coords = activeCoordinates.length > 0 ? activeCoordinates : [];
+    if (coords.length === 0) {
+      return {
+        meanPlddt: activeMeanPlddt,
+        coreMean: 92.0,
+        cdr3Mean: 80.0,
+        totalResidues: candidate.sequence.length,
+        highConfidencePct: 85.0
+      };
+    }
+    const coreCoords = coords.filter(c => c.region === 'FR1' || c.region === 'FR2' || c.region === 'FR3' || c.region === 'FR4');
+    const cdr3Coords = coords.filter(c => c.region === 'CDR3');
     const coreMean = coreCoords.length ? coreCoords.reduce((a, b) => a + b.plddt, 0) / coreCoords.length : 92;
     const cdr3Mean = cdr3Coords.length ? cdr3Coords.reduce((a, b) => a + b.plddt, 0) / cdr3Coords.length : 80;
 
     return {
-      meanPlddt,
+      meanPlddt: activeMeanPlddt,
       coreMean: Number(coreMean.toFixed(1)),
       cdr3Mean: Number(cdr3Mean.toFixed(1)),
-      totalResidues: coordinates.length,
+      totalResidues: coords.length,
       highConfidencePct: Number(
-        ((coordinates.filter(c => c.plddt >= 90).length / coordinates.length) * 100).toFixed(1)
+        ((coords.filter(c => c.plddt >= 90).length / coords.length) * 100).toFixed(1)
       )
     };
-  }, [coordinates, meanPlddt]);
+  }, [activeCoordinates, activeMeanPlddt, candidate.sequence.length]);
 
   // Three.js interactive 3D scene setup
   useEffect(() => {
+    const coordinates = activeCoordinates;
     if (!containerRef.current || coordinates.length < 5) return;
 
     const container = containerRef.current;
@@ -322,12 +394,13 @@ export function EsmFoldPreview({ candidate, compact = false }: EsmFoldPreviewPro
       tubeGeometry.dispose();
       tubeMaterial.dispose();
     };
-  }, [coordinates, colorMode, isSpinning, showDisulfide, showHallmarks, compact, isFullscreen]);
+  }, [activeCoordinates, colorMode, isSpinning, showDisulfide, showHallmarks, compact, isFullscreen]);
 
   // Download PDB file
   const handleDownloadPdb = () => {
+    const pdb = activePdbText || generateVhhPdb(candidate.sequence, candidate.name, candidate.regions).pdbText;
     const filename = `${candidate.name.replace(/[^a-zA-Z0-9_-]/g, '_')}_ESMFold.pdb`;
-    const blob = new Blob([pdbText], { type: 'chemical/x-pdb;charset=utf-8' });
+    const blob = new Blob([pdb], { type: 'chemical/x-pdb;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
@@ -349,19 +422,42 @@ export function EsmFoldPreview({ candidate, compact = false }: EsmFoldPreviewPro
           <div className="flex items-center gap-2">
             <Layers className="w-4 h-4 text-cyan-400" />
             <h3 className="text-sm font-semibold text-white font-['Plus_Jakarta_Sans'] flex items-center gap-2">
-              <span>ESMFold 3D Structure Preview</span>
-              <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+              <span>ESMFold 3D Structure</span>
+              <span className={`text-[10px] uppercase font-mono px-2 py-0.5 rounded border flex items-center gap-1.5 ${
+                isLiveApi
+                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                  : 'bg-cyan-500/10 text-cyan-400 border-cyan-500/20'
+              }`}>
+                {isLiveApi && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />}
+                <span>{isLiveApi ? 'ESMFold v1 (Meta AI Live)' : 'Biophysical Fold'}</span>
+              </span>
+              <span className="text-[10px] uppercase font-mono px-2 py-0.5 rounded bg-blue-500/10 text-blue-300 border border-blue-500/20">
                 Mean pLDDT: {stats.meanPlddt}
               </span>
             </h3>
           </div>
           <p className="text-xs text-slate-400 mt-0.5">
-            Atomistic single-domain beta-sandwich fold with pLDDT confidence scoring and paratope projection.
+            Atomistic single-domain beta-sandwich fold with per-residue pLDDT confidence and paratope projection.
           </p>
         </div>
 
         {/* View and Mode Controls */}
         <div className="flex items-center gap-2">
+          {/* Re-fold with ESMFold Live API Button */}
+          <button
+            onClick={() => requestEsmFoldPrediction(candidate.sequence, candidate.name)}
+            disabled={apiLoading}
+            className={`flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-lg transition-colors border ${
+              apiLoading
+                ? 'bg-slate-800 text-slate-400 border-slate-700 cursor-not-allowed'
+                : 'bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-300 border-cyan-500/30'
+            }`}
+            title="Perform direct ESMFold neural prediction from Meta AI API"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${apiLoading ? 'animate-spin text-cyan-400' : ''}`} />
+            <span>{apiLoading ? 'Folding...' : 'ESMFold API'}</span>
+          </button>
+
           {/* Color Mode Switcher */}
           <div className="flex items-center bg-slate-900 rounded-lg p-1 border border-slate-800 text-xs">
             <button
@@ -428,8 +524,8 @@ export function EsmFoldPreview({ candidate, compact = false }: EsmFoldPreviewPro
         {/* 3D Feature Overlay Badges (Top Left) */}
         <div className="absolute top-3 left-3 flex flex-col gap-1.5 pointer-events-none">
           <div className="bg-slate-900/80 backdrop-blur-sm px-2.5 py-1 rounded-md border border-slate-800 text-[11px] text-slate-300 font-mono flex items-center gap-2">
-            <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse" />
-            <span>ESMFold Model Quality: {stats.meanPlddt} (Confident)</span>
+            <span className={`w-2 h-2 rounded-full ${isLiveApi ? 'bg-emerald-400 animate-pulse' : 'bg-cyan-400 animate-pulse'}`} />
+            <span>{isLiveApi ? 'Meta ESMFold v1 Model' : 'Biophysical Fold Model'}: {stats.meanPlddt} pLDDT</span>
           </div>
 
           <div className="bg-slate-900/80 backdrop-blur-sm px-2.5 py-1 rounded-md border border-slate-800 text-[10px] text-slate-400 font-mono flex items-center gap-3">
@@ -437,6 +533,13 @@ export function EsmFoldPreview({ candidate, compact = false }: EsmFoldPreviewPro
             <span>CDR3 Paratope: <strong className="text-pink-400">{stats.cdr3Mean}</strong></span>
             <span>Residues: <strong>{stats.totalResidues} aa</strong></span>
           </div>
+
+          {apiNotice && (
+            <div className="bg-slate-900/90 backdrop-blur-sm px-2.5 py-1 rounded-md border border-slate-800 text-[10px] text-slate-400 flex items-center gap-1.5">
+              <Info className="w-3 h-3 text-cyan-400 shrink-0" />
+              <span>{apiNotice}</span>
+            </div>
+          )}
         </div>
 
         {/* Disulfide & Hallmarks Toggles (Top Right) */}
